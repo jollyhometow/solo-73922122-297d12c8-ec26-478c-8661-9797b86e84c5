@@ -34,3 +34,15 @@ print(f"total 5xx: {d[\"total\"]}")
 for i in d["items"]:
     print(f"  {i[\"status\"]} {i[\"path\"]:<24} src={i[\"source_code\"]} @{i[\"byte_offset\"]}")
 '
+
+echo
+echo "== field-structure baselines =="
+curl -fsS "$API/schema-baselines" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(f"baselines: {len(d[\"items\"])}")
+for b in d["items"]:
+    print(f"  {b[\"id\"]:<24} src={b[\"source_code\"]:<28} "
+          f"lines={b[\"line_count\"]} frozen_offset={b[\"frozen_offset\"]} "
+          f"fields={b[\"field_count\"]}")
+'

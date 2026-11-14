@@ -9,6 +9,14 @@ GET  /events                 paginated events, filter by path / status /
                              status range / source code
 GET  /events/{event_id}      single event with the raw JSON line
 GET  /malformed              quarantined lines that failed JSON parsing
+
+Field-structure audit (raw-line based, see app/audit.py)
+--------------------------------------------------------
+POST /schema-baselines            create a baseline for a tracked file
+GET  /schema-baselines            list baselines
+GET  /schema-baselines/{id}       get one baseline (frozen offset + fields)
+POST /schema-baselines/{id}/check compare another physical file in one
+                                  committed snapshot
 """
 
 from __future__ import annotations
@@ -22,7 +30,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import storage
+from . import audit, storage
 from .ingest import CollectorLoop, poll_once
 
 logging.basicConfig(
@@ -244,3 +252,76 @@ def list_malformed(limit: int = Query(100, ge=1, le=1000),
     ).fetchall()
     return {"total": total, "limit": limit, "offset": offset,
             "items": [dict(r) for r in rows]}
+
+
+# --------------------------------------------------------------------------- #
+# Field-structure audit: baselines + drift checks against raw JSON lines.
+# --------------------------------------------------------------------------- #
+
+class BaselineCreateRequest(BaseModel):
+    dev: int = Field(..., description="设备号 st_dev，与 /ingest/progress 一致")
+    inode: int = Field(..., description="inode 号 st_ino，与 /ingest/progress 一致")
+    baseline_id: Optional[str] = Field(
+        None,
+        description="用户指定的基线 ID；留空则自动生成。重复时返回 409。",
+        min_length=1,
+        max_length=128,
+    )
+
+
+class DriftCheckRequest(BaseModel):
+    target_dev: int = Field(..., description="另一物理文件的设备号 st_dev")
+    target_inode: int = Field(..., description="另一物理文件的 inode st_ino")
+
+
+def _audit_guard(fn, *args, **kwargs):
+    """Translate domain errors onto FastAPI HTTP responses."""
+    try:
+        return fn(*args, **kwargs)
+    except audit.AuditError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+
+@app.post("/schema-baselines", tags=["schema-audit"], status_code=201)
+def create_schema_baseline(req: BaselineCreateRequest):
+    """为已追踪日志建立字段结构基线。
+
+    仅使用创建时**已提交、可解析的完整行**：至少一行，且每行顶层字段名与
+    JSON 类型完全一致，否则 422 且不留任何记录。基线保存后冻结当时的续采
+    偏移，文件追加或服务重启都不会改变它。
+    """
+    return _audit_guard(
+        audit.create_baseline,
+        DB_PATH,
+        dev=req.dev,
+        inode=req.inode,
+        baseline_id=req.baseline_id,
+    )
+
+
+@app.get("/schema-baselines", tags=["schema-audit"])
+def list_schema_baselines():
+    return {"items": audit.list_baselines(DB_PATH)}
+
+
+@app.get("/schema-baselines/{baseline_id}", tags=["schema-audit"])
+def get_schema_baseline(baseline_id: str):
+    return _audit_guard(audit.get_baseline, DB_PATH, baseline_id)
+
+
+@app.post("/schema-baselines/{baseline_id}/check", tags=["schema-audit"])
+def check_schema_drift(baseline_id: str, req: DriftCheckRequest):
+    """在同一已提交快照内核查另一物理文件。
+
+    返回缺失字段、新增字段、类型改变字段各自的受影响行数与最早字节位置，
+    并注明坏 JSON 行数。采集持续提交时不会混入后来的行（单一只读事务持有
+    WAL 快照）。原始 ``status`` 由数字变成数字字符串时，即使 ``/events``
+    仍返回整数，这里也会作为类型改变检出。
+    """
+    return _audit_guard(
+        audit.check_drift,
+        DB_PATH,
+        baseline_id=baseline_id,
+        target_dev=req.target_dev,
+        target_inode=req.target_inode,
+    )

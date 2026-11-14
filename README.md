@@ -23,10 +23,11 @@
 ├── collector/              # FastAPI + SQLite 采集/查询服务
 │   ├── app/storage.py      # 表结构、事务、查询
 │   ├── app/ingest.py       # 目录扫描、inode 识别、完整行切分、续采
+│   ├── app/audit.py        # 字段结构基线与漂移核查（基于 raw_line 原文）
 │   └── app/main.py         # API（/docs 可用）
 ├── nginx/                  # JSON 行日志格式 + 可控轮转脚本
 ├── traffic/                # 持续请求生成器（含 4xx/5xx）
-└── tests/                  # 41 项单元/集成断言 + 端到端模拟
+└── tests/                  # 单元/集成断言 + 端到端模拟
 ```
 
 ## 快速开始
@@ -67,6 +68,67 @@ docker compose up -d --force-recreate nginx
 轮转后共享目录里同时存在 `access.log` 与所有
 `access.log.<时间戳>.log` 归档，采集器分别追踪、全部保留。
 
+## 字段结构核查（基线 / 漂移检测）
+
+改动 Nginx 日志格式后，需要确认**原始字段**是否变化。注意采集入库时
+`status` 等字段会被归一化（`int(status)`），所以即使原始行把状态码写成
+字符串 `"500"`，`/events` 返回的仍然是整数 —— 只看查询接口会掩盖问题。
+本功能直接重新解析 `raw_line` 原文，比较**顶层字段名与 JSON 原生类型**，
+不经过任何归一化。
+
+### 概念
+
+* **基线（baseline）**：按 `dev` + `inode` 选择一个**已追踪**日志文件，
+  仅使用创建时**已提交、可解析的完整行**建立。要求至少一行，且每行顶层
+  字段与 JSON 类型完全一致，否则创建失败（422）且**不留任何记录**。
+  保存时冻结当时的续采偏移 `frozen_offset`；之后文件追加、服务重启都
+  不会改变基线内容。
+* **核查（check）**：用户指定基线 ID 与**另一物理文件**（同样按
+  `dev` + `inode`），服务在**同一个只读事务快照**内取得该文件的续采
+  位置与原始行，输出：
+  - `missing_fields` / `added_fields` / `type_changed_fields`：每项含
+    `affected_lines`（受影响行数）与 `earliest_byte_offset`（最早字节位置）；
+  - `bad_json_lines`：坏 JSON 行数及其最早字节位置；
+  - `drifted`：是否存在任何差异。
+  采集线程同时持续提交时，WAL 快照保证核查不会混入后来的行。
+
+### 操作示例
+
+```bash
+# 1) 从 /ingest/progress 拿到要建基线文件的 dev / inode
+curl -s localhost:8000/ingest/progress | python3 -m json.tool
+
+# 2) 建立基线（baseline_id 可自定义，留空则自动生成）
+curl -s -X POST localhost:8000/schema-baselines \
+  -H 'Content-Type: application/json' \
+  -d '{"dev": 64, "inode": 12345, "baseline_id": "before-format-change"}'
+
+# 3) 列出 / 查看基线（含冻结偏移与字段类型清单）
+curl -s localhost:8000/schema-baselines | python3 -m json.tool
+curl -s localhost:8000/schema-baselines/before-format-change
+
+# 4) 改完日志格式并轮转后，对新物理文件做核查
+curl -s -X POST \
+  localhost:8000/schema-baselines/before-format-change/check \
+  -H 'Content-Type: application/json' \
+  -d '{"target_dev": 64, "target_inode": 67890}' | python3 -m json.tool
+```
+
+`type_changed_fields` 中典型的一项（数字状态码变成数字字符串）：
+
+```json
+{
+  "field": "status",
+  "affected_lines": 42,
+  "earliest_byte_offset": 1024,
+  "types": [{"baseline_type": "integer", "observed_type": "string"}]
+}
+```
+
+即使 `/events?status=500` 仍能查到这些请求（入库时 `int("500")=500`），
+该类型改变也会被检出。错误码：文件未追踪 `404`、无可用完整行/结构不一致
+`422`、基线 ID 重复 `409`、基线不存在 `404`。
+
 ## 常用查询
 
 ```bash
@@ -102,6 +164,10 @@ curl -s localhost:8000/malformed
 | GET | `/events` | 分页取数，支持 `path`、`status`、`status_min/max`、`source_code`、`limit`、`offset` |
 | GET | `/events/{id}` | 单条事件（含原始 JSON 行 `raw_line`） |
 | GET | `/malformed` | 坏行隔离区 |
+| POST | `/schema-baselines` | 为已追踪文件建立字段结构基线（冻结续采偏移） |
+| GET | `/schema-baselines` | 列出全部基线 |
+| GET | `/schema-baselines/{id}` | 查看单条基线（字段与 JSON 类型清单） |
+| POST | `/schema-baselines/{id}/check` | 同一已提交快照内核查另一物理文件的字段漂移 |
 
 ## 数据模型
 
@@ -110,6 +176,8 @@ log_events(id, ts, path, status, method, source_code,
            dev, inode, byte_offset, raw_line, ingested_at)
 ingest_state(dev, inode, source_code, path, offset, last_seen)  -- 续采位置
 malformed_lines(..., raw_line, error)                            -- 坏行隔离
+field_baselines(id, dev, inode, source_code, frozen_offset,
+                field_count, line_count, fields_json, created_at) -- 字段基线
 ```
 
 - `source_code`：来源文件代号（当前文件名/归档名）。
@@ -134,12 +202,16 @@ malformed_lines(..., raw_line, error)                            -- 坏行隔离
 python3 -m venv --without-pip .venv && . .venv/bin/activate
 # 若 venv 内无 pip：python get-pip.py
 pip install -r collector/requirements.txt httpx pyyaml
-python -I tests/test_collector.py   # 41 项：部分行/轮转/崩溃恢复/重复行/API
-python -I tests/e2e_sim.py          # 完整服务启停 + 轮转 + 重启续采 E2E
+python -I tests/test_collector.py   # 46 项：部分行/轮转/崩溃恢复/重复行/API
+python -I tests/test_audit.py       # 49 项：基线冻结/失败不留痕/快照隔离/类型漂移
+python -I tests/e2e_sim.py          # 完整服务启停 + 轮转 + 重启续采 + 字段核查 E2E
 ```
 
 覆盖的关键场景：未换行尾部等待补齐、rename 轮转双 inode、旧 inode 延迟写入、
-20 轮随机“进程退出”后续采不漏不重、相同内容多行保留、坏行隔离、分页与过滤。
+20 轮随机“进程退出”后续采不漏不重、相同内容多行保留、坏行隔离、分页与过滤；
+基线至少一行且字段/类型完全一致、创建失败不留记录、追加与重启不改变冻结
+偏移、核查单事务快照不混入后续提交行、数字状态码变数字字符串（`/events`
+仍返回整数）照样检出。
 
 ## 故障排查
 

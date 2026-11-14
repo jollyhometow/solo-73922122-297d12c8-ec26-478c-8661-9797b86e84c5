@@ -74,6 +74,28 @@ CREATE TABLE IF NOT EXISTS malformed_lines (
     error       TEXT    NOT NULL,
     ingested_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Field-structure baselines (see app/audit.py).
+--
+-- A baseline freezes, for one tracked physical file identified by
+-- (dev, inode):
+--   * the committed resume offset at creation time -- appends and service
+--     restarts move ingest_state.offset forward but never touch this value;
+--   * the ordered set of top-level fields and their raw JSON types, derived
+--     exclusively from complete, parseable, already-committed lines.
+-- The whole row is written in one transaction (audit.create_baseline), so a
+-- failed validation rolls back and leaves no baseline record behind.
+CREATE TABLE IF NOT EXISTS field_baselines (
+    id              TEXT    PRIMARY KEY,
+    dev             INTEGER NOT NULL,
+    inode           INTEGER NOT NULL,
+    source_code     TEXT    NOT NULL,
+    frozen_offset   INTEGER NOT NULL,
+    field_count     INTEGER NOT NULL,
+    line_count      INTEGER NOT NULL,
+    fields_json     TEXT    NOT NULL,  -- [{"name": ..., "type": ...}, ...]
+    created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 """
 
 

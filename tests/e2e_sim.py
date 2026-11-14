@@ -64,6 +64,17 @@ def post(path):
         return r.status, json.loads(r.read())
 
 
+def post_json(path, body):
+    req = urllib.request.Request(
+        BASE_URL + path, data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
 def jline(path, status):
     return json.dumps({"time": "2026-11-13T10:00:00Z", "path": path,
                        "status": status, "method": "GET"}) + "\n"
@@ -195,6 +206,86 @@ def main():
                   {"access.log", "access.log.arc1.log"}
                   and all(f["complete"] for f in prog["files"]),
                   str(prog["files"]))
+
+        print("[F] 字段结构核查：基线 + 轮转后另一物理文件漂移检出")
+        # Baseline on the current access.log (all integer statuses).
+        cur_st = os.stat(cur)
+        code, bl = post_json("/schema-baselines", {
+            "dev": cur_st.st_dev, "inode": cur_st.st_ino,
+            "baseline_id": "e2e-baseline"})
+        check("baseline created (201) from committed lines",
+              code == 201 and bl["line_count"] >= 1
+              and bl["frozen_offset"] == cur_st.st_size
+              and any(f["name"] == "status" and f["type"] == "integer"
+                      for f in bl["fields"]),
+              str((code, bl)))
+        frozen = bl["frozen_offset"]
+
+        # Rotate so the target is a brand-new physical file (new inode).
+        archive2 = os.path.join(LOG_DIR, "access.log.arc2.log")
+        os.rename(cur, archive2)
+        arch_fh2 = open(archive2, "a")
+        # New log format: status emitted as a numeric string, plus a new field.
+        new_lines = [
+            json.dumps({"time": "2026-11-13T11:00:00Z", "path": "/v2/a",
+                        "status": "200", "method": "GET",
+                        "trace_id": "t-1"}) + "\n",
+            json.dumps({"time": "2026-11-13T11:00:01Z", "path": "/v2/b",
+                        "status": "503", "method": "GET",
+                        "trace_id": "t-2"}) + "\n",
+            "{not valid json\n",
+        ]
+        with open(cur, "w") as fh:
+            for ln in new_lines:
+                fh.write(ln)
+        post("/ingest/poll-now")
+        new_st = os.stat(cur)
+
+        # Append more lines AFTER the check request would run; they must not
+        # leak into an in-flight snapshot result.
+        code, report = post_json(
+            "/schema-baselines/e2e-baseline/check",
+            {"target_dev": new_st.st_dev, "target_inode": new_st.st_ino})
+        check("drift check 200 against another inode",
+              code == 200 and report["target"]["inode"] == new_st.st_ino
+              and report["target"]["source_code"] == "access.log",
+              str(code))
+        changed = {c["field"]: c for c in report["type_changed_fields"]}
+        check("numeric->string status detected from raw lines",
+              changed.get("status", {}).get("affected_lines") == 2
+              and changed["status"]["types"][0] ==
+              {"baseline_type": "integer", "observed_type": "string"},
+              str(report["type_changed_fields"]))
+        added = {a["field"]: a for a in report["added_fields"]}
+        check("new trace_id field detected with earliest offset",
+              added.get("trace_id", {}).get("affected_lines") == 2
+              and added["trace_id"]["earliest_byte_offset"] == 0,
+              str(report["added_fields"]))
+        check("bad JSON line counted with its byte offset",
+              report["bad_json_lines"]["count"] == 1
+              and report["bad_json_lines"]["earliest_byte_offset"]
+              == sum(len(l.encode()) for l in new_lines[:2]),
+              str(report["bad_json_lines"]))
+        check("drifted flag true", report["drifted"] is True)
+
+        # /events still shows integer statuses for the string-raw lines.
+        _, ev = get("/events?path=/v2/b")
+        check("/events coerces string status back to integer",
+              ev["total"] == 1 and ev["items"][0]["status"] == 503
+              and isinstance(ev["items"][0]["status"], int), str(ev))
+
+        # Baseline stays frozen despite further ingestion + another poll.
+        with open(cur, "a") as fh:
+            fh.write(json.dumps({"time": "2026-11-13T11:00:02Z",
+                                 "path": "/v2/c", "status": "201",
+                                 "method": "GET"}) + "\n")
+        post("/ingest/poll-now")
+        _, bl_again = get("/schema-baselines/e2e-baseline")
+        check("baseline frozen offset and lines immutable after appends",
+              bl_again["frozen_offset"] == frozen
+              and bl_again["line_count"] == bl["line_count"],
+              str((bl_again["frozen_offset"], frozen)))
+        arch_fh2.close()
     finally:
         srv2.should_exit = True
         t2.join(timeout=10)
